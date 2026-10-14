@@ -7,6 +7,7 @@ import {
   isTimeBuffered,
   joinBuffers,
   makeCdnCandidates,
+  maxConcurrentIntervals,
   mediaDurationSeconds,
   parseContentRange,
   parseHeaders,
@@ -17,6 +18,9 @@ const PREFIX = "[R34 Thread Ripper]";
 const log = (...values) => console.info(PREFIX, ...values);
 const warn = (...values) => console.warn(PREFIX, ...values);
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const toMiB = (bytes) => bytes / (1024 * 1024);
+const rateMiBPerSecond = (bytes, milliseconds) => milliseconds > 0 ? toMiB(bytes) / (milliseconds / 1_000) : 0;
+const rounded = (value, digits = 2) => Number(value.toFixed(digits));
 
 class HttpError extends Error {
   constructor(message, status = 0) {
@@ -26,9 +30,163 @@ class HttpError extends Error {
   }
 }
 
+class PerformanceStats {
+  constructor(video, configuredThreads) {
+    this.video = video;
+    this.configuredThreads = configuredThreads;
+    this.batches = [];
+    this.hosts = new Map();
+    this.seekRecoveries = [];
+    this.stallCount = 0;
+    this.stallMilliseconds = 0;
+    this.stallStartedAt = null;
+    this.seekStartedAt = null;
+    this.attached = false;
+    this.onWaiting = () => {
+      if (this.video.paused || this.video.seeking || this.seekStartedAt !== null || this.stallStartedAt !== null) return;
+      this.stallStartedAt = performance.now();
+      this.stallCount += 1;
+    };
+    this.onSeeking = () => {
+      if (this.seekStartedAt === null) this.seekStartedAt = performance.now();
+    };
+    this.onSeeked = () => {
+      if (this.video.paused) this.finishSeekRecovery();
+    };
+    this.onPlaying = () => {
+      this.finishStall();
+      this.finishSeekRecovery();
+    };
+  }
+
+  recordBatch({ start, end, pieces, responses, startedAt, completedAt }) {
+    const elapsedMilliseconds = completedAt - startedAt;
+    const totalBytes = end - start + 1;
+    const intervals = responses.map((response) => ({
+      start: response.timing.startedAt,
+      end: response.timing.completedAt,
+    }));
+    const peakParallelism = maxConcurrentIntervals(intervals);
+    const batch = {
+      number: this.batches.length + 1,
+      totalBytes,
+      elapsedMilliseconds,
+      peakParallelism,
+      requestedThreads: pieces.length,
+    };
+    this.batches.push(batch);
+
+    const details = pieces.map((piece, index) => {
+      const response = responses[index];
+      const host = new URL(response.finalUrl).hostname;
+      const bytes = piece.end - piece.start + 1;
+      const elapsed = response.timing.completedAt - response.timing.startedAt;
+      const ttfb = response.timing.firstByteAt - response.timing.startedAt;
+      const cache = response.headers.get("x-stitch-cdn-cache") || "?";
+      const aggregate = this.hosts.get(host) ?? {
+        host,
+        requests: 0,
+        bytes: 0,
+        transferMilliseconds: 0,
+        ttfbMilliseconds: 0,
+        cacheHits: 0,
+      };
+      aggregate.requests += 1;
+      aggregate.bytes += bytes;
+      aggregate.transferMilliseconds += elapsed;
+      aggregate.ttfbMilliseconds += ttfb;
+      if (cache.toUpperCase() === "HIT") aggregate.cacheHits += 1;
+      this.hosts.set(host, aggregate);
+      return {
+        CDN: host,
+        bytes: `${piece.start}-${piece.end}`,
+        MiB: rounded(toMiB(bytes)),
+        "近似 TTFB (ms)": Math.round(ttfb),
+        "耗時 (ms)": Math.round(elapsed),
+        "速度 (MiB/s)": rounded(rateMiBPerSecond(bytes, elapsed)),
+        cache,
+      };
+    });
+
+    log(
+      `批次 #${batch.number}：${pieces.length} 線程（實際峰值 ${peakParallelism}），` +
+      `${rounded(toMiB(totalBytes))} MiB / ${rounded(elapsedMilliseconds / 1_000)} 秒 = ` +
+      `${rounded(rateMiBPerSecond(totalBytes, elapsedMilliseconds))} MiB/s`,
+    );
+    console.table(details);
+  }
+
+  attach() {
+    if (this.attached) return;
+    this.attached = true;
+    this.video.addEventListener("waiting", this.onWaiting);
+    this.video.addEventListener("seeking", this.onSeeking);
+    this.video.addEventListener("seeked", this.onSeeked);
+    this.video.addEventListener("playing", this.onPlaying);
+  }
+
+  finishStall() {
+    if (this.stallStartedAt === null) return;
+    this.stallMilliseconds += performance.now() - this.stallStartedAt;
+    this.stallStartedAt = null;
+  }
+
+  finishSeekRecovery() {
+    if (this.seekStartedAt === null) return;
+    this.seekRecoveries.push(performance.now() - this.seekStartedAt);
+    this.seekStartedAt = null;
+  }
+
+  detach() {
+    if (!this.attached) return;
+    this.finishStall();
+    this.attached = false;
+    this.video.removeEventListener("waiting", this.onWaiting);
+    this.video.removeEventListener("seeking", this.onSeeking);
+    this.video.removeEventListener("seeked", this.onSeeked);
+    this.video.removeEventListener("playing", this.onPlaying);
+  }
+
+  snapshot() {
+    const totalBytes = this.batches.reduce((sum, batch) => sum + batch.totalBytes, 0);
+    const activeMilliseconds = this.batches.reduce((sum, batch) => sum + batch.elapsedMilliseconds, 0);
+    const averageSeek = this.seekRecoveries.length
+      ? this.seekRecoveries.reduce((sum, milliseconds) => sum + milliseconds, 0) / this.seekRecoveries.length
+      : 0;
+    return {
+      configuredThreads: this.configuredThreads,
+      batches: this.batches.length,
+      downloadedMiB: rounded(toMiB(totalBytes)),
+      activeDownloadSeconds: rounded(activeMilliseconds / 1_000),
+      aggregateMiBPerSecond: rounded(rateMiBPerSecond(totalBytes, activeMilliseconds)),
+      peakParallelism: Math.max(0, ...this.batches.map((batch) => batch.peakParallelism)),
+      stalls: this.stallCount,
+      stallSeconds: rounded(this.stallMilliseconds / 1_000),
+      seeks: this.seekRecoveries.length,
+      averageSeekRecoverySeconds: rounded(averageSeek / 1_000),
+    };
+  }
+
+  printSummary() {
+    const overall = this.snapshot();
+    const hosts = [...this.hosts.values()].map((host) => ({
+      CDN: host.host,
+      requests: host.requests,
+      MiB: rounded(toMiB(host.bytes)),
+      "平均 TTFB (ms)": Math.round(host.ttfbMilliseconds / host.requests),
+      "平均速度 (MiB/s)": rounded(rateMiBPerSecond(host.bytes, host.transferMilliseconds)),
+      "cache HIT": `${host.cacheHits}/${host.requests}`,
+    }));
+    log("本次播放效能摘要", overall);
+    if (hosts.length) console.table(hosts);
+    return { overall, hosts };
+  }
+}
+
 class RangeClient {
-  constructor(referrer) {
+  constructor(referrer, stats) {
     this.referrer = referrer;
+    this.stats = stats;
     this.urls = [];
     this.cursor = 0;
     this.active = new Set();
@@ -45,6 +203,8 @@ class RangeClient {
   request(url, start, end) {
     return new Promise((resolve, reject) => {
       let settled = false;
+      const startedAt = performance.now();
+      let firstByteAt = null;
       const request = GM_xmlhttpRequest({
         method: "GET",
         url,
@@ -54,7 +214,11 @@ class RangeClient {
         },
         responseType: "arraybuffer",
         timeout: 20_000,
+        onprogress: () => {
+          if (firstByteAt === null) firstByteAt = performance.now();
+        },
         onload: (response) => {
+          const completedAt = performance.now();
           settled = true;
           this.active.delete(request);
           const headers = parseHeaders(response.responseHeaders);
@@ -71,6 +235,11 @@ class RangeClient {
             range,
             finalUrl: response.finalUrl || url,
             headers,
+            timing: {
+              startedAt,
+              firstByteAt: firstByteAt ?? completedAt,
+              completedAt,
+            },
           });
         },
         onerror: () => {
@@ -120,12 +289,11 @@ class RangeClient {
     if (Date.now() >= this.cooldownUntil) this.effectiveThreads = settings.threads;
     const threads = Math.min(this.effectiveThreads, settings.threads);
     const pieces = splitRange(start, end, threads, DEFAULTS.requestBytes);
+    const startedAt = performance.now();
     const responses = await Promise.all(pieces.map((piece, index) =>
       this.fetchPiece(piece, this.cursor + index)));
-    log(`Range 批次：${pieces.length} 線程`, pieces.map((piece, index) => ({
-      bytes: `${piece.start}-${piece.end}`,
-      cdn: new URL(responses[index].finalUrl).hostname,
-    })));
+    const completedAt = performance.now();
+    this.stats.recordBatch({ start, end, pieces, responses, startedAt, completedAt });
     this.cursor = (this.cursor + pieces.length) % this.urls.length;
     return joinBuffers(responses.map((response) => response.buffer));
   }
@@ -210,7 +378,8 @@ class PlaybackSession {
     this.originalUrl = originalUrl;
     this.originalTime = video.currentTime || 0;
     this.wasPaused = video.paused;
-    this.client = new RangeClient(location.href);
+    this.stats = new PerformanceStats(video, settings.threads);
+    this.client = new RangeClient(location.href, this.stats);
     this.mediaSource = new MediaSource();
     this.objectUrl = URL.createObjectURL(this.mediaSource);
     this.mp4 = createFile();
@@ -396,6 +565,7 @@ class PlaybackSession {
     this.video.addEventListener("seeking", this.onSeeking);
     await this.appendQueue.idle();
     this.video.currentTime = Math.min(this.originalTime, this.durationSeconds);
+    this.stats.attach();
     if (!this.wasPaused) this.video.play().catch(() => {});
     log(`接管完成：${settings.threads} 線程、${this.client.urls.length} 個 CDN`);
     await this.pump();
@@ -406,6 +576,7 @@ class PlaybackSession {
     this.stopped = true;
     this.client.abortAll();
     this.video.removeEventListener("seeking", this.onSeeking);
+    this.stats.detach();
     this.mp4.stop();
   }
 
@@ -445,7 +616,14 @@ GM_registerMenuCommand(`線程數：${settings.threads}（1–8）`, () => {
 });
 
 let activeSession = null;
+let lastStats = null;
 let attemptedUrl = null;
+
+GM_registerMenuCommand("輸出本次效能統計", () => {
+  const stats = activeSession?.stats ?? lastStats;
+  if (!stats) return alert("目前還沒有可輸出的播放統計。");
+  stats.printSummary();
+});
 
 function findVideo() {
   return [...document.querySelectorAll("video")]
@@ -466,6 +644,7 @@ async function maybeStart() {
   } catch (error) {
     await activeSession.fallback(error);
   } finally {
+    lastStats = activeSession?.stats ?? lastStats;
     activeSession = null;
   }
 }

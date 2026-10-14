@@ -5,6 +5,7 @@ import {
   commonSegmentSampleCount,
   joinBuffers,
   makeCdnCandidates,
+  maxConcurrentIntervals,
   mediaDurationSeconds,
   parseContentRange,
   parseHeaders,
@@ -62,4 +63,14 @@ test("converts MP4 movie duration from timescale units to seconds", () => {
   assert.equal(mediaDurationSeconds({ duration: 425_900, timescale: 1_000 }), 425.9);
   assert.equal(mediaDurationSeconds({ duration: 0, timescale: 1_000 }), null);
   assert.equal(mediaDurationSeconds({ duration: 10, timescale: 0 }), null);
+});
+
+test("calculates actual peak overlap between request intervals", () => {
+  assert.equal(maxConcurrentIntervals([
+    { start: 0, end: 100 },
+    { start: 5, end: 80 },
+    { start: 100, end: 120 },
+  ]), 2);
+  assert.equal(maxConcurrentIntervals([{ start: 0, end: 1 }]), 1);
+  assert.equal(maxConcurrentIntervals([]), 0);
 });

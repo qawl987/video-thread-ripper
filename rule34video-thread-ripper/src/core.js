@@ -110,3 +110,20 @@ export function mediaDurationSeconds(info) {
   if (!Number.isFinite(duration) || !Number.isFinite(timescale) || duration <= 0 || timescale <= 0) return null;
   return duration / timescale;
 }
+
+export function maxConcurrentIntervals(intervals) {
+  const events = [];
+  for (const interval of intervals) {
+    if (!Number.isFinite(interval?.start) || !Number.isFinite(interval?.end) || interval.end < interval.start) continue;
+    events.push({ time: interval.start, delta: 1 });
+    events.push({ time: interval.end, delta: -1 });
+  }
+  events.sort((left, right) => left.time - right.time || left.delta - right.delta);
+  let active = 0;
+  let maximum = 0;
+  for (const event of events) {
+    active += event.delta;
+    maximum = Math.max(maximum, active);
+  }
+  return maximum;
+}
