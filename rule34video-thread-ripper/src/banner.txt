@@ -1,0 +1,17 @@
+// ==UserScript==
+// @name         Rule34Video Thread Ripper
+// @namespace    https://github.com/local/video-thread-ripper
+// @version      0.1.2
+// @description  Bounded multi-CDN, multi-request buffering for Rule34Video playback.
+// @author       local
+// @match        https://rule34video.com/video/*
+// @run-at       document-idle
+// @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @connect      rule34video.com
+// @connect      boomio-cdn.com
+// @connect      *.boomio-cdn.com
+// @license      MIT
+// ==/UserScript==

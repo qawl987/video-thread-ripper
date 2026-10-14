@@ -1,0 +1,17 @@
+{
+  "name": "rule34video-thread-ripper",
+  "version": "0.1.2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check": "npm run test && npm run build"
+  },
+  "dependencies": {
+    "mp4box": "2.4.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.11"
+  }
+}
