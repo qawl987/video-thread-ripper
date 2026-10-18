@@ -4,6 +4,7 @@ export const DEFAULTS = Object.freeze({
   maxCdns: 3,
   probeBytes: 16 * 1024,
   requestBytes: 1024 * 1024,
+  minAdaptivePieceBytes: 256 * 1024,
   maxBatchBytes: 4 * 1024 * 1024,
   bufferAheadSeconds: 30,
   resumeAheadSeconds: 10,
@@ -68,15 +69,228 @@ export function makeCdnCandidates(url, limit = DEFAULTS.maxCdns) {
   const match = /^(?<region>[a-z]+)-cdn(?<number>\d{2})-prem\.boomio-cdn\.com$/i.exec(parsed.hostname);
   if (!match) return [url];
   const originalNumber = Number(match.groups.number);
-  const nextNumber = originalNumber >= 4 ? 1 : originalNumber + 1;
-  const previousNumber = originalNumber <= 1 ? 4 : originalNumber - 1;
-  const order = [originalNumber, nextNumber, previousNumber, 1, 2, 3, 4]
+  const order = [originalNumber, originalNumber + 1, originalNumber - 1]
+    .filter((number) => number >= 1 && number <= 99)
     .filter((value, index, values) => values.indexOf(value) === index);
   return order.slice(0, Math.max(1, limit)).map((number) => {
     const candidate = new URL(parsed);
     candidate.hostname = `${match.groups.region}-cdn${String(number).padStart(2, "0")}-prem.boomio-cdn.com`;
     return candidate.href;
   });
+}
+
+export function splitRangeWeighted(start, endInclusive, weights, minimumBytes = DEFAULTS.minAdaptivePieceBytes) {
+  if (endInclusive < start || !weights.length) return [];
+  const length = endInclusive - start + 1;
+  const count = weights.length;
+  const normalized = weights.map((value) => Math.max(0.000001, Number(value) || 0));
+  let sizes = new Array(count).fill(0);
+
+  if (length < minimumBytes * count) {
+    sizes = splitRange(start, endInclusive, count, 1).map((piece) => piece.end - piece.start + 1);
+  } else {
+    let remaining = length;
+    let active = normalized.map((_value, index) => index);
+    while (active.length) {
+      const totalWeight = active.reduce((sum, index) => sum + normalized[index], 0);
+      const belowMinimum = active.filter((index) => remaining * normalized[index] / totalWeight < minimumBytes);
+      if (!belowMinimum.length) {
+        let assigned = 0;
+        for (const index of active) {
+          sizes[index] = Math.floor(remaining * normalized[index] / totalWeight);
+          assigned += sizes[index];
+        }
+        let remainder = remaining - assigned;
+        for (const index of active) {
+          if (!remainder) break;
+          sizes[index] += 1;
+          remainder -= 1;
+        }
+        break;
+      }
+      for (const index of belowMinimum) {
+        sizes[index] = minimumBytes;
+        remaining -= minimumBytes;
+      }
+      active = active.filter((index) => !belowMinimum.includes(index));
+    }
+  }
+
+  const pieces = [];
+  let cursor = start;
+  for (let index = 0; index < sizes.length; index += 1) {
+    const end = index === sizes.length - 1 ? endInclusive : cursor + sizes[index] - 1;
+    pieces.push({ start: cursor, end, index });
+    cursor = end + 1;
+  }
+  return pieces;
+}
+
+export class AdaptiveCdnPool {
+  constructor(options = {}) {
+    this.alpha = Number(options.alpha) || 0.35;
+    this.measurementTtlMs = Number(options.measurementTtlMs) || 90_000;
+    this.exploreEveryBatches = Number(options.exploreEveryBatches) || 8;
+    this.slowRatio = Number(options.slowRatio) || 0.5;
+    this.minimumSampleBytes = Number(options.minimumSampleBytes) || DEFAULTS.minAdaptivePieceBytes;
+    this.states = new Map();
+    this.batchNumber = 0;
+  }
+
+  setUrls(urls) {
+    const unique = urls.filter((url, index, all) => all.indexOf(url) === index);
+    const next = new Map();
+    for (const url of unique) {
+      next.set(url, this.states.get(url) ?? {
+        url,
+        host: new URL(url).hostname,
+        ewmaBps: 0,
+        ewmaTtfbMs: 0,
+        samples: 0,
+        failures: 0,
+        blockedUntil: 0,
+        lastMeasuredAt: 0,
+        lastAssignedBatch: 0,
+        cacheHits: 0,
+        cacheMisses: 0,
+        credit: 0,
+      });
+    }
+    this.states = next;
+  }
+
+  urls() {
+    return [...this.states.keys()];
+  }
+
+  state(url) {
+    return this.states.get(url) ?? null;
+  }
+
+  isFresh(state, now) {
+    return state.samples > 0 && now - state.lastMeasuredAt < this.measurementTtlMs;
+  }
+
+  recordSuccess(url, sample, now = Date.now()) {
+    const state = this.state(url);
+    if (!state) return null;
+    const elapsedMs = Math.max(1, Number(sample.elapsedMs) || 0);
+    const bytes = Math.max(0, Number(sample.bytes) || 0);
+    const ttfbMs = Math.max(0, Number(sample.ttfbMs) || 0);
+    const stale = state.lastMeasuredAt && now - state.lastMeasuredAt >= this.measurementTtlMs;
+    state.failures = 0;
+    state.blockedUntil = 0;
+    state.ewmaTtfbMs = state.ewmaTtfbMs
+      ? state.ewmaTtfbMs * (1 - this.alpha) + ttfbMs * this.alpha
+      : ttfbMs;
+    if (bytes >= this.minimumSampleBytes) {
+      const bps = bytes * 1_000 / elapsedMs;
+      state.ewmaBps = !state.ewmaBps || stale
+        ? bps
+        : state.ewmaBps * (1 - this.alpha) + bps * this.alpha;
+      state.samples += 1;
+      state.lastMeasuredAt = now;
+    }
+    const cache = String(sample.cache || "").toUpperCase();
+    if (cache === "HIT") state.cacheHits += 1;
+    else if (cache === "MISS") state.cacheMisses += 1;
+    return this.snapshot(url, now);
+  }
+
+  recordFailure(url, error, now = Date.now()) {
+    if (error?.name === "AbortError") return;
+    const state = this.state(url);
+    if (!state) return;
+    state.failures += 1;
+    state.blockedUntil = now + Math.min(60_000, 3_000 * (2 ** Math.min(state.failures - 1, 4)));
+  }
+
+  eligible(now = Date.now()) {
+    const all = [...this.states.values()];
+    const open = all.filter((state) => state.blockedUntil <= now);
+    return open.length ? open : all;
+  }
+
+  retryOrder(preferredUrl, now = Date.now()) {
+    const candidates = this.eligible(now).slice().sort((left, right) => {
+      if (left.url === preferredUrl) return -1;
+      if (right.url === preferredUrl) return 1;
+      return Number(this.isFresh(right, now)) - Number(this.isFresh(left, now)) || right.ewmaBps - left.ewmaBps;
+    });
+    return candidates.map((state) => state.url);
+  }
+
+  pickWeighted(states, now) {
+    const fresh = states.filter((state) => this.isFresh(state, now));
+    if (!fresh.length) return states[0];
+    const top = Math.max(...fresh.map((state) => state.ewmaBps));
+    const eligible = fresh.filter((state) => state.ewmaBps >= top * this.slowRatio);
+    const pool = eligible.length ? eligible : fresh;
+    const total = pool.reduce((sum, state) => sum + state.ewmaBps, 0);
+    let selected = pool[0];
+    for (const state of pool) {
+      state.credit += state.ewmaBps;
+      if (state.credit > selected.credit) selected = state;
+    }
+    selected.credit -= total;
+    return selected;
+  }
+
+  plan(count, now = Date.now()) {
+    this.batchNumber += 1;
+    const available = this.eligible(now);
+    if (!available.length || count <= 0) return [];
+    const selected = [];
+    const unused = available.filter((state) => state.samples === 0)
+      .sort((left, right) => left.lastAssignedBatch - right.lastAssignedBatch);
+    while (selected.length < count && unused.length) {
+      selected.push({ state: unused.shift(), reason: "warmup" });
+    }
+
+    if (selected.length < count && !selected.length) {
+      const retest = available
+        .filter((state) => !this.isFresh(state, now) || this.batchNumber - state.lastAssignedBatch >= this.exploreEveryBatches)
+        .sort((left, right) => left.lastMeasuredAt - right.lastMeasuredAt)[0];
+      if (retest) selected.push({ state: retest, reason: "retest" });
+    }
+
+    while (selected.length < count) {
+      const state = this.pickWeighted(available, now);
+      selected.push({ state, reason: "weighted" });
+    }
+
+    const freshSpeeds = available.filter((state) => this.isFresh(state, now)).map((state) => state.ewmaBps);
+    const fallbackSpeed = freshSpeeds.length ? Math.max(...freshSpeeds) : 1;
+    return selected.map(({ state, reason }) => {
+      state.lastAssignedBatch = this.batchNumber;
+      const fresh = this.isFresh(state, now);
+      return {
+        url: state.url,
+        host: state.host,
+        reason,
+        weight: fresh ? state.ewmaBps : reason === "retest" ? fallbackSpeed * 0.01 : fallbackSpeed * 0.25,
+      };
+    });
+  }
+
+  snapshot(url, now = Date.now()) {
+    const state = this.state(url);
+    if (!state) return null;
+    return {
+      host: state.host,
+      ewmaBps: this.isFresh(state, now) ? state.ewmaBps : 0,
+      ewmaTtfbMs: state.ewmaTtfbMs,
+      samples: state.samples,
+      failures: state.failures,
+      blockedUntil: state.blockedUntil,
+      cacheHits: state.cacheHits,
+      cacheMisses: state.cacheMisses,
+    };
+  }
+
+  status(now = Date.now()) {
+    return [...this.states.keys()].map((url) => this.snapshot(url, now));
+  }
 }
 
 export function bufferedAhead(video) {

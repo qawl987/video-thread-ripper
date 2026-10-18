@@ -1,5 +1,6 @@
 import { createFile } from "mp4box";
 import {
+  AdaptiveCdnPool,
   DEFAULTS,
   bufferedAhead,
   clampInteger,
@@ -12,6 +13,7 @@ import {
   parseContentRange,
   parseHeaders,
   splitRange,
+  splitRangeWeighted,
 } from "./core.js";
 
 const PREFIX = "[R34 Thread Ripper]";
@@ -90,20 +92,24 @@ class PerformanceStats {
         transferMilliseconds: 0,
         ttfbMilliseconds: 0,
         cacheHits: 0,
+        ewmaBps: 0,
       };
       aggregate.requests += 1;
       aggregate.bytes += bytes;
       aggregate.transferMilliseconds += elapsed;
       aggregate.ttfbMilliseconds += ttfb;
       if (cache.toUpperCase() === "HIT") aggregate.cacheHits += 1;
+      aggregate.ewmaBps = response.health?.ewmaBps || aggregate.ewmaBps;
       this.hosts.set(host, aggregate);
       return {
         CDN: host,
         bytes: `${piece.start}-${piece.end}`,
         MiB: rounded(toMiB(bytes)),
+        選擇: response.selectionReason,
         "近似 TTFB (ms)": Math.round(ttfb),
         "耗時 (ms)": Math.round(elapsed),
         "速度 (MiB/s)": rounded(rateMiBPerSecond(bytes, elapsed)),
+        "EWMA (MiB/s)": rounded((response.health?.ewmaBps || 0) / (1024 * 1024)),
         cache,
       };
     });
@@ -175,6 +181,7 @@ class PerformanceStats {
       MiB: rounded(toMiB(host.bytes)),
       "平均 TTFB (ms)": Math.round(host.ttfbMilliseconds / host.requests),
       "平均速度 (MiB/s)": rounded(rateMiBPerSecond(host.bytes, host.transferMilliseconds)),
+      "目前 EWMA (MiB/s)": rounded(host.ewmaBps / (1024 * 1024)),
       "cache HIT": `${host.cacheHits}/${host.requests}`,
     }));
     log("本次播放效能摘要", overall);
@@ -188,7 +195,7 @@ class RangeClient {
     this.referrer = referrer;
     this.stats = stats;
     this.urls = [];
-    this.cursor = 0;
+    this.pool = new AdaptiveCdnPool();
     this.active = new Set();
     this.cooldownUntil = 0;
     this.effectiveThreads = settings.threads;
@@ -198,6 +205,11 @@ class RangeClient {
   abortAll() {
     for (const request of this.active) request.abort();
     this.active.clear();
+  }
+
+  setUrls(urls) {
+    this.urls = urls;
+    this.pool.setUrls(urls);
   }
 
   request(url, start, end) {
@@ -262,16 +274,31 @@ class RangeClient {
     });
   }
 
-  async fetchPiece(piece, preferredIndex) {
+  async fetchPiece(piece, preferredUrl, selectionReason) {
     let lastError;
-    const attempts = Math.min(3, Math.max(1, this.urls.length));
+    const candidates = this.pool.retryOrder(preferredUrl);
+    const attempts = Math.min(3, Math.max(1, candidates.length));
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-      const url = this.urls[(preferredIndex + attempt) % this.urls.length];
+      const url = candidates[attempt];
       try {
-        return await this.request(url, piece.start, piece.end);
+        const response = await this.request(url, piece.start, piece.end);
+        const elapsedMs = response.timing.completedAt - response.timing.startedAt;
+        const ttfbMs = response.timing.firstByteAt - response.timing.startedAt;
+        const health = this.pool.recordSuccess(url, {
+          bytes: response.buffer.byteLength,
+          elapsedMs,
+          ttfbMs,
+          cache: response.headers.get("x-stitch-cdn-cache"),
+        });
+        return {
+          ...response,
+          health,
+          selectionReason: attempt ? `retry-${attempt}` : selectionReason,
+        };
       } catch (error) {
         lastError = error;
         if (error?.name === "AbortError") throw error;
+        this.pool.recordFailure(url, error);
         if (error?.status === 429) {
           this.effectiveThreads = 1;
           this.cooldownUntil = Date.now() + 15_000;
@@ -288,13 +315,24 @@ class RangeClient {
   async fetchBatch(start, end) {
     if (Date.now() >= this.cooldownUntil) this.effectiveThreads = settings.threads;
     const threads = Math.min(this.effectiveThreads, settings.threads);
-    const pieces = splitRange(start, end, threads, DEFAULTS.requestBytes);
+    const pieceCount = splitRange(start, end, threads, DEFAULTS.requestBytes).length;
+    const plan = this.pool.plan(pieceCount);
+    if (!plan.length) throw new Error("No verified CDN is available");
+    const pieces = splitRangeWeighted(
+      start,
+      end,
+      plan.map((item) => item.weight),
+      DEFAULTS.minAdaptivePieceBytes,
+    ).map((piece, index) => ({
+      ...piece,
+      preferredUrl: plan[index].url,
+      selectionReason: plan[index].reason,
+    }));
     const startedAt = performance.now();
-    const responses = await Promise.all(pieces.map((piece, index) =>
-      this.fetchPiece(piece, this.cursor + index)));
+    const responses = await Promise.all(pieces.map((piece) =>
+      this.fetchPiece(piece, piece.preferredUrl, piece.selectionReason)));
     const completedAt = performance.now();
     this.stats.recordBatch({ start, end, pieces, responses, startedAt, completedAt });
-    this.cursor = (this.cursor + pieces.length) % this.urls.length;
     return joinBuffers(responses.map((response) => response.buffer));
   }
 }
@@ -418,7 +456,7 @@ class PlaybackSession {
         warn("略過無法驗證的 CDN", new URL(candidate).hostname, error.message);
       }
     }
-    this.client.urls = valid;
+    this.client.setUrls(valid);
     log("已驗證 CDN", valid.map((url) => new URL(url).hostname));
     return primary.buffer;
   }

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  AdaptiveCdnPool,
   clampInteger,
   commonSegmentSampleCount,
   joinBuffers,
@@ -10,6 +11,7 @@ import {
   parseContentRange,
   parseHeaders,
   splitRange,
+  splitRangeWeighted,
 } from "../src/core.js";
 
 test("parses case-insensitive response headers and a valid partial range", () => {
@@ -45,6 +47,15 @@ test("builds a bounded same-region Boomio candidate list", () => {
   ]);
 });
 
+test("discovers adjacent CDN numbers without wrapping newer nodes back to cdn01", () => {
+  const source = "https://eu-cdn11-prem.boomio-cdn.com/remote_control.php?file=x&acctoken=y";
+  assert.deepEqual(makeCdnCandidates(source, 3).map((url) => new URL(url).hostname), [
+    "eu-cdn11-prem.boomio-cdn.com",
+    "eu-cdn12-prem.boomio-cdn.com",
+    "eu-cdn10-prem.boomio-cdn.com",
+  ]);
+});
+
 test("normalizes the user thread setting", () => {
   assert.equal(clampInteger("4", 1, 8, 3), 4);
   assert.equal(clampInteger(99, 1, 8, 3), 8);
@@ -73,4 +84,28 @@ test("calculates actual peak overlap between request intervals", () => {
   ]), 2);
   assert.equal(maxConcurrentIntervals([{ start: 0, end: 1 }]), 1);
   assert.equal(maxConcurrentIntervals([]), 0);
+});
+
+test("splits a batch by measured speed while bounding a slow trial", () => {
+  const pieces = splitRangeWeighted(0, 2 * 1024 * 1024 - 1, [3.3, 0.28], 256 * 1024);
+  assert.equal(pieces.length, 2);
+  assert.equal(pieces[1].end - pieces[1].start + 1, 256 * 1024);
+  assert.equal(pieces[0].end + 1, pieces[1].start);
+  assert.equal(pieces[1].end, 2 * 1024 * 1024 - 1);
+});
+
+test("adaptive CDN pool favors the fast node and periodically retests the slow one", () => {
+  const first = "https://eu-cdn10-prem.boomio-cdn.com/file.mp4?t=x";
+  const second = "https://eu-cdn11-prem.boomio-cdn.com/file.mp4?t=x";
+  const pool = new AdaptiveCdnPool({ exploreEveryBatches: 8, measurementTtlMs: 90_000 });
+  pool.setUrls([first, second]);
+  assert.deepEqual(pool.plan(2, 0).map((item) => item.reason), ["warmup", "warmup"]);
+  pool.recordSuccess(first, { bytes: 1024 * 1024, elapsedMs: 300, ttfbMs: 220, cache: "HIT" }, 100);
+  pool.recordSuccess(second, { bytes: 1024 * 1024, elapsedMs: 3500, ttfbMs: 240, cache: "HIT" }, 100);
+  assert.deepEqual(pool.plan(2, 200).map((item) => item.url), [first, first]);
+  for (let index = 0; index < 6; index += 1) pool.plan(2, 300 + index);
+  const retest = pool.plan(2, 400);
+  assert.equal(retest[0].url, second);
+  assert.equal(retest[0].reason, "retest");
+  assert.equal(retest[1].url, first);
 });
