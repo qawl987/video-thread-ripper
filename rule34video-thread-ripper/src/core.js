@@ -128,10 +128,12 @@ export function splitRangeWeighted(start, endInclusive, weights, minimumBytes = 
 
 export class AdaptiveCdnPool {
   constructor(options = {}) {
-    this.alpha = Number(options.alpha) || 0.35;
+    this.alphaDown = Number(options.alphaDown) || 0.7;
+    this.alphaUp = Number(options.alphaUp) || 0.2;
+    this.alphaTtfb = Number(options.alphaTtfb) || 0.35;
     this.measurementTtlMs = Number(options.measurementTtlMs) || 90_000;
-    this.exploreEveryBatches = Number(options.exploreEveryBatches) || 8;
-    this.slowRatio = Number(options.slowRatio) || 0.5;
+    this.exploreEveryBatches = Number(options.exploreEveryBatches) || 4;
+    this.slowRatio = Number(options.slowRatio) || 0.75;
     this.minimumSampleBytes = Number(options.minimumSampleBytes) || DEFAULTS.minAdaptivePieceBytes;
     this.states = new Map();
     this.batchNumber = 0;
@@ -145,6 +147,7 @@ export class AdaptiveCdnPool {
         url,
         host: new URL(url).hostname,
         ewmaBps: 0,
+        lastBps: 0,
         ewmaTtfbMs: 0,
         samples: 0,
         failures: 0,
@@ -171,6 +174,11 @@ export class AdaptiveCdnPool {
     return state.samples > 0 && now - state.lastMeasuredAt < this.measurementTtlMs;
   }
 
+  score(state, now) {
+    if (!this.isFresh(state, now)) return 0;
+    return Math.min(state.ewmaBps, state.lastBps || state.ewmaBps);
+  }
+
   recordSuccess(url, sample, now = Date.now()) {
     const state = this.state(url);
     if (!state) return null;
@@ -181,13 +189,15 @@ export class AdaptiveCdnPool {
     state.failures = 0;
     state.blockedUntil = 0;
     state.ewmaTtfbMs = state.ewmaTtfbMs
-      ? state.ewmaTtfbMs * (1 - this.alpha) + ttfbMs * this.alpha
+      ? state.ewmaTtfbMs * (1 - this.alphaTtfb) + ttfbMs * this.alphaTtfb
       : ttfbMs;
     if (bytes >= this.minimumSampleBytes) {
       const bps = bytes * 1_000 / elapsedMs;
+      const alpha = state.ewmaBps && bps < state.ewmaBps ? this.alphaDown : this.alphaUp;
       state.ewmaBps = !state.ewmaBps || stale
         ? bps
-        : state.ewmaBps * (1 - this.alpha) + bps * this.alpha;
+        : state.ewmaBps * (1 - alpha) + bps * alpha;
+      state.lastBps = bps;
       state.samples += 1;
       state.lastMeasuredAt = now;
     }
@@ -215,7 +225,7 @@ export class AdaptiveCdnPool {
     const candidates = this.eligible(now).slice().sort((left, right) => {
       if (left.url === preferredUrl) return -1;
       if (right.url === preferredUrl) return 1;
-      return Number(this.isFresh(right, now)) - Number(this.isFresh(left, now)) || right.ewmaBps - left.ewmaBps;
+      return Number(this.isFresh(right, now)) - Number(this.isFresh(left, now)) || this.score(right, now) - this.score(left, now);
     });
     return candidates.map((state) => state.url);
   }
@@ -223,24 +233,37 @@ export class AdaptiveCdnPool {
   pickWeighted(states, now) {
     const fresh = states.filter((state) => this.isFresh(state, now));
     if (!fresh.length) return states[0];
-    const top = Math.max(...fresh.map((state) => state.ewmaBps));
-    const eligible = fresh.filter((state) => state.ewmaBps >= top * this.slowRatio);
+    const top = Math.max(...fresh.map((state) => this.score(state, now)));
+    const eligible = fresh.filter((state) => this.score(state, now) >= top * this.slowRatio);
     const pool = eligible.length ? eligible : fresh;
-    const total = pool.reduce((sum, state) => sum + state.ewmaBps, 0);
+    const total = pool.reduce((sum, state) => sum + this.score(state, now), 0);
     let selected = pool[0];
     for (const state of pool) {
-      state.credit += state.ewmaBps;
+      state.credit += this.score(state, now);
       if (state.credit > selected.credit) selected = state;
     }
     selected.credit -= total;
     return selected;
   }
 
-  plan(count, now = Date.now()) {
+  plan(count, now = Date.now(), options = {}) {
     this.batchNumber += 1;
     const available = this.eligible(now);
     if (!available.length || count <= 0) return [];
     const selected = [];
+    if (options.urgent) {
+      const measured = available.filter((state) => this.isFresh(state, now));
+      if (measured.length) {
+        const fastest = measured.reduce((best, state) => this.score(state, now) > this.score(best, now) ? state : best);
+        fastest.lastAssignedBatch = this.batchNumber;
+        return Array.from({ length: count }, () => ({
+          url: fastest.url,
+          host: fastest.host,
+          reason: "urgent",
+          weight: this.score(fastest, now),
+        }));
+      }
+    }
     const unused = available.filter((state) => state.samples === 0)
       .sort((left, right) => left.lastAssignedBatch - right.lastAssignedBatch);
     while (selected.length < count && unused.length) {
@@ -259,7 +282,7 @@ export class AdaptiveCdnPool {
       selected.push({ state, reason: "weighted" });
     }
 
-    const freshSpeeds = available.filter((state) => this.isFresh(state, now)).map((state) => state.ewmaBps);
+    const freshSpeeds = available.filter((state) => this.isFresh(state, now)).map((state) => this.score(state, now));
     const fallbackSpeed = freshSpeeds.length ? Math.max(...freshSpeeds) : 1;
     return selected.map(({ state, reason }) => {
       state.lastAssignedBatch = this.batchNumber;
@@ -268,7 +291,7 @@ export class AdaptiveCdnPool {
         url: state.url,
         host: state.host,
         reason,
-        weight: fresh ? state.ewmaBps : reason === "retest" ? fallbackSpeed * 0.01 : fallbackSpeed * 0.25,
+        weight: fresh ? this.score(state, now) : reason === "retest" ? fallbackSpeed * 0.01 : fallbackSpeed * 0.25,
       };
     });
   }
@@ -279,6 +302,8 @@ export class AdaptiveCdnPool {
     return {
       host: state.host,
       ewmaBps: this.isFresh(state, now) ? state.ewmaBps : 0,
+      lastBps: state.lastBps,
+      scoreBps: this.score(state, now),
       ewmaTtfbMs: state.ewmaTtfbMs,
       samples: state.samples,
       failures: state.failures,

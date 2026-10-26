@@ -93,6 +93,7 @@ class PerformanceStats {
         ttfbMilliseconds: 0,
         cacheHits: 0,
         ewmaBps: 0,
+        scoreBps: 0,
       };
       aggregate.requests += 1;
       aggregate.bytes += bytes;
@@ -100,6 +101,7 @@ class PerformanceStats {
       aggregate.ttfbMilliseconds += ttfb;
       if (cache.toUpperCase() === "HIT") aggregate.cacheHits += 1;
       aggregate.ewmaBps = response.health?.ewmaBps || aggregate.ewmaBps;
+      aggregate.scoreBps = response.health?.scoreBps || aggregate.scoreBps;
       this.hosts.set(host, aggregate);
       return {
         CDN: host,
@@ -110,6 +112,7 @@ class PerformanceStats {
         "耗時 (ms)": Math.round(elapsed),
         "速度 (MiB/s)": rounded(rateMiBPerSecond(bytes, elapsed)),
         "EWMA (MiB/s)": rounded((response.health?.ewmaBps || 0) / (1024 * 1024)),
+        "排程分數 (MiB/s)": rounded((response.health?.scoreBps || 0) / (1024 * 1024)),
         cache,
       };
     });
@@ -182,6 +185,7 @@ class PerformanceStats {
       "平均 TTFB (ms)": Math.round(host.ttfbMilliseconds / host.requests),
       "平均速度 (MiB/s)": rounded(rateMiBPerSecond(host.bytes, host.transferMilliseconds)),
       "目前 EWMA (MiB/s)": rounded(host.ewmaBps / (1024 * 1024)),
+      "目前排程分數 (MiB/s)": rounded(host.scoreBps / (1024 * 1024)),
       "cache HIT": `${host.cacheHits}/${host.requests}`,
     }));
     log("本次播放效能摘要", overall);
@@ -312,11 +316,14 @@ class RangeClient {
     throw lastError;
   }
 
-  async fetchBatch(start, end) {
+  async fetchBatch(start, end, options = {}) {
     if (Date.now() >= this.cooldownUntil) this.effectiveThreads = settings.threads;
     const threads = Math.min(this.effectiveThreads, settings.threads);
-    const pieceCount = splitRange(start, end, threads, DEFAULTS.requestBytes).length;
-    const plan = this.pool.plan(pieceCount);
+    const rangeLength = end - start + 1;
+    const pieceCount = options.urgent
+      ? Math.max(1, Math.min(threads, Math.ceil(rangeLength / DEFAULTS.minAdaptivePieceBytes)))
+      : splitRange(start, end, threads, DEFAULTS.requestBytes).length;
+    const plan = this.pool.plan(pieceCount, Date.now(), options);
     if (!plan.length) throw new Error("No verified CDN is available");
     const pieces = splitRangeWeighted(
       start,
@@ -429,6 +436,7 @@ class PlaybackSession {
     this.readyError = null;
     this.durationSeconds = null;
     this.seekRequest = null;
+    this.urgentBatches = 0;
     this.appendQueue = null;
     this.onSeeking = () => {
       if (!this.ready || isTimeBuffered(this.video, this.video.currentTime)) return;
@@ -542,6 +550,7 @@ class PlaybackSession {
     this.appendQueue?.clear();
     const seek = this.mp4.seek(requestedTime, true);
     this.nextOffset = seek.offset;
+    this.urgentBatches = 2;
     log(`跳轉到 ${requestedTime.toFixed(1)} 秒，從 byte ${this.nextOffset} 續傳`);
     return true;
   }
@@ -551,17 +560,21 @@ class PlaybackSession {
       await this.handleSeek();
       await this.waitForRoom();
       if (this.stopped) break;
-      const batchBytes = Math.min(
-        DEFAULTS.maxBatchBytes,
-        Math.max(DEFAULTS.requestBytes, this.client.effectiveThreads * DEFAULTS.requestBytes),
-      );
+      const urgent = this.urgentBatches > 0;
+      const batchBytes = urgent
+        ? DEFAULTS.requestBytes
+        : Math.min(
+          DEFAULTS.maxBatchBytes,
+          Math.max(DEFAULTS.requestBytes, this.client.effectiveThreads * DEFAULTS.requestBytes),
+        );
       const end = Math.min(this.totalBytes - 1, this.nextOffset + batchBytes - 1);
       const offset = this.nextOffset;
       try {
-        const buffer = await this.client.fetchBatch(offset, end);
+        const buffer = await this.client.fetchBatch(offset, end, { urgent });
         if (this.seekRequest !== null) continue;
         this.appendToMp4(buffer, offset);
         this.nextOffset = end + 1;
+        if (urgent) this.urgentBatches -= 1;
       } catch (error) {
         if (error?.name === "AbortError" && this.seekRequest !== null) continue;
         if (this.client.rateLimited) {

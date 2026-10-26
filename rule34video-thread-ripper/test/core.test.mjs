@@ -109,3 +109,32 @@ test("adaptive CDN pool favors the fast node and periodically retests the slow o
   assert.equal(retest[0].reason, "retest");
   assert.equal(retest[1].url, first);
 });
+
+test("adaptive CDN score reacts faster to slowdowns than recoveries", () => {
+  const url = "https://eu-cdn05-prem.boomio-cdn.com/file.mp4?t=x";
+  const pool = new AdaptiveCdnPool();
+  pool.setUrls([url]);
+  pool.recordSuccess(url, { bytes: 3 * 1024 * 1024, elapsedMs: 1_000, ttfbMs: 200 }, 1);
+  const initial = pool.snapshot(url, 2).ewmaBps;
+  pool.recordSuccess(url, { bytes: 1024 * 1024, elapsedMs: 1_000, ttfbMs: 200 }, 3);
+  const afterSlowdown = pool.snapshot(url, 4).ewmaBps;
+  const slowdownScore = pool.snapshot(url, 4).scoreBps;
+  pool.recordSuccess(url, { bytes: 3 * 1024 * 1024, elapsedMs: 1_000, ttfbMs: 200 }, 5);
+  const afterRecovery = pool.snapshot(url, 6).ewmaBps;
+  assert.equal(Math.round(initial / 1024), 3072);
+  assert.equal(Math.round(afterSlowdown / 1024), 1638);
+  assert.equal(Math.round(slowdownScore / 1024), 1024);
+  assert.equal(Math.round(afterRecovery / 1024), 1925);
+});
+
+test("urgent planning sends every slot to the currently fastest CDN", () => {
+  const fast = "https://eu-cdn06-prem.boomio-cdn.com/file.mp4?t=x";
+  const variable = "https://eu-cdn05-prem.boomio-cdn.com/file.mp4?t=x";
+  const pool = new AdaptiveCdnPool();
+  pool.setUrls([fast, variable]);
+  pool.recordSuccess(fast, { bytes: 3 * 1024 * 1024, elapsedMs: 1_000, ttfbMs: 200 }, 1);
+  pool.recordSuccess(variable, { bytes: 1024 * 1024, elapsedMs: 1_000, ttfbMs: 200 }, 1);
+  const plan = pool.plan(2, 2, { urgent: true });
+  assert.deepEqual(plan.map((item) => item.url), [fast, fast]);
+  assert.deepEqual(plan.map((item) => item.reason), ["urgent", "urgent"]);
+});
